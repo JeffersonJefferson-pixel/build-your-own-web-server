@@ -1,121 +1,6 @@
 import * as net from "net";
-
-// Dynamic buffer is larger than the appended data to amortize the cost of copying.
-// this avoids appending data by concatentation which copy old data.
-type DynBuf = {
-    data: Buffer,
-    length: number, // actual data length.
-}
-
-// append data to dynamic buffer.
-function bufPush(buf: DynBuf, data: Buffer): void {
-    const newLen = buf.length + data.length;
-    // check if exceeds capacity.
-    if (buf.data.length < newLen) {
-        // expand capacity.
-        let cap = Math.max(buf.data.length, 32);
-        // double capacity until enough.
-        while (cap < newLen) {
-            cap *= 2;
-        }
-        // allocate new buffer.
-        const grown  = Buffer.alloc(cap);
-        buf.data.copy(grown, 0, 0);
-        buf.data = grown;
-    }
-    // append data to buffer.
-    data.copy(buf.data, buf.length, 0);
-    buf.length = newLen;
-}
-
-// pop data from buffer.
-function bufPop(buf: DynBuf, len: number): void {
-    // move data to the front.
-    buf.data.copyWithin(0, len, buf.length);
-    buf.length -= len;
-}
-
-type TCPConn = {
-    socket: net.Socket;
-    err: null | Error;
-    ended: boolean;
-    reader: null | {
-        resolve: (value: Buffer) => void,
-        reject: (reason: Error) => void,
-    }
-}
-
-// create wrapper for net.Socket
-function soInit(socket: net.Socket): TCPConn {
-    const conn: TCPConn = {
-        socket, err: null, ended: false, reader: null
-    }
-    socket.on('data', (data: Buffer) => {
-        // pause data event.
-        // this implements backpressure.
-        conn.socket.pause();
-        // fulfill current read.
-        conn.reader!.resolve(data);
-        conn.reader = null;
-    });
-    socket.on('end', () => {
-        conn.ended = true;
-        // fulfill current read.
-        if (conn.reader) {
-            conn.reader.resolve(Buffer.from('')); // EOF
-            conn.reader = null;
-        }
-    });
-    socket.on('error', (err: Error) => {
-        // fulfill current read.
-        conn.err = err;
-        if (conn.reader) {
-            conn.reader.reject(err);
-            conn.reader = null;
-        }
-    })
-    return conn;
-}
-
-function soRead(conn: TCPConn): Promise<Buffer> {
-    // no concurrent calls.
-    console.assert(!conn.reader);
-    return new Promise((resolve, reject) => {
-        if (conn.err) {
-            reject(conn.err);
-            return;
-        }
-        if (conn.ended) {
-            // EOF.
-            resolve(Buffer.from(''));
-            return;
-        }
-        // save callbacks to reader.
-        conn.reader = {resolve, reject};
-        // resume data event.
-        // only resumes when event handling completes.
-        conn.socket.resume();
-    });
-}
-
-function soWrite(conn: TCPConn, data: Buffer): Promise<void> {
-    console.assert(data.length > 0);
-    return new Promise((resolve, reject) => {
-        if (conn.err) {
-            reject(conn.err);
-            return;
-        }
-
-        conn.socket.write(data, (err?: Error) => {
-            if (err) {
-                reject(err);
-            } else {
-                resolve();
-            }
-        });
-    });
-}
-
+import { DynBuf, bufPush, bufPop } from "./dynamic_buffer";
+import { TCPConn, soInit, soRead, soWrite } from "./socket";
 
 // test if message is complete using delimiter.
 function cutMessage(buf: DynBuf): null | Buffer {
@@ -136,6 +21,7 @@ async function serveClient(socket: net.Socket): Promise<void> {
     const buf: DynBuf = { data: Buffer.alloc(0), length: 0 };
     while (true) {
         // try to get message from buffer.
+        // this enables pipelining.
         const msg: null | Buffer = cutMessage(buf);
         if (!msg) {
             // need more data.
